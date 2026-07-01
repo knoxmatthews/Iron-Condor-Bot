@@ -3,7 +3,13 @@ name: Iron Condor Bot
 on:
   schedule:
     - cron: '45 13 * * 1-5'
+    - cron: '45 19 * * 1-5'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode: open or close'
+        required: false
+        default: 'open'
 
 jobs:
   run-bot:
@@ -19,10 +25,20 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install alpaca-py schedule python-dotenv
+        run: pip install alpaca-py python-dotenv
+
+      - name: Determine mode
+        id: mode
+        run: |
+          HOUR=$(date -u +%H)
+          if [ "$HOUR" -lt "16" ]; then
+            echo "mode=open" >> $GITHUB_OUTPUT
+          else
+            echo "mode=close" >> $GITHUB_OUTPUT
+          fi
 
       - name: Run Iron Condor Bot
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: python iron_condor.py
+        run: python iron_condor.py ${{ steps.mode.outputs.mode }}
