@@ -33,7 +33,7 @@ API_KEY    = os.environ.get("ALPACA_API_KEY", "")
 API_SECRET = os.environ.get("ALPACA_SECRET_KEY", "")
 PAPER      = True
 
-QTY          = 1
+QTY          = 5
 WING_WIDTH   = 5      # $5 wide wings on SPX, $2 on SPY
 OTM_PCT      = 0.005  # 0.5% OTM for short strikes - tight for max premium
 PROFIT_TARGET = 0.50  # close at 50% of max profit
