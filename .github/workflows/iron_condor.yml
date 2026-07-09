@@ -1,44 +1,38 @@
-name: Iron Condor Bot
+name: 0 DTE Condor Bot
 
 on:
   schedule:
-    - cron: '45 13 * * 1-5'
-    - cron: '45 19 * * 1-5'
+    - cron: '30 14 * * 1-5'
+    - cron: '0 19 * * 1-5'
+    - cron: '0 20 * * 1-5'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Run mode: open or close'
-        required: false
+        description: 'Mode: open, close, or force-close'
+        required: true
         default: 'open'
 
 jobs:
-  run-bot:
+  run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install alpaca-py python-dotenv
-
-      - name: Determine mode
-        id: mode
-        run: |
-          HOUR=$(date -u +%H)
-          if [ "$HOUR" -lt "16" ]; then
-            echo "mode=open" >> $GITHUB_OUTPUT
-          else
-            echo "mode=close" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run Iron Condor Bot
+      - run: pip install alpaca-py python-dotenv
+      - name: Run condor bot
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: python iron_condor.py ${{ steps.mode.outputs.mode }}
+        run: |
+          HOUR=$(date -u +%H)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python iron_condor.py ${{ github.event.inputs.mode }}
+          elif [ "$HOUR" = "14" ]; then
+            python iron_condor.py open
+          elif [ "$HOUR" = "20" ]; then
+            python iron_condor.py force-close
+          else
+            python iron_condor.py close
+          fi
