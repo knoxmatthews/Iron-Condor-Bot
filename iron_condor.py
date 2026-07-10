@@ -1,10 +1,7 @@
 """
-0 DTE Iron Condor Bot - SPX/SPY
---------------------------------
-Opens a same-day expiry iron condor every market morning.
-Collects theta premium and closes at 50% profit or 3pm ET.
-Uses SPX first, falls back to SPY if SPX unavailable.
-Alpaca PAPER only. GitHub Actions triggers open + close.
+0 DTE Iron Condor Bot - SPY
+Uses limit orders to ensure defined risk spread margin treatment.
+Opens every market day morning, closes at 50% profit or 3pm ET.
 """
 
 import os
@@ -15,10 +12,10 @@ from zoneinfo import ZoneInfo
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
-    MarketOrderRequest,
+    LimitOrderRequest,
     GetOptionContractsRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, ContractType
+from alpaca.trading.enums import OrderSide, TimeInForce, ContractType, AssetClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
@@ -33,15 +30,14 @@ API_KEY    = os.environ.get("ALPACA_API_KEY", "")
 API_SECRET = os.environ.get("ALPACA_SECRET_KEY", "")
 PAPER      = True
 
-QTY          = 5
-WING_WIDTH   = 5      # $5 wide wings on SPX, $2 on SPY
-OTM_PCT      = 0.005  # 0.5% OTM for short strikes - tight for max premium
-PROFIT_TARGET = 0.50  # close at 50% of max profit
-CLOSE_TIME   = (15, 0)  # force close at 3pm ET no matter what
+UNDERLYING    = "SPY"
+QTY           = 1
+WING_WIDTH    = 2      # $2 wide spreads = $200 max risk per spread
+OTM_PCT       = 0.005  # 0.5% OTM short strikes
+PROFIT_TARGET = 0.50   # close at 50% profit
 
 ET = ZoneInfo("America/New_York")
 
-# US market holidays 2026
 HOLIDAYS = {
     datetime.date(2026, 1, 1),
     datetime.date(2026, 1, 19),
@@ -64,27 +60,27 @@ def is_market_day(date=None):
     return d.weekday() < 5 and d not in HOLIDAYS
 
 
-def get_price(symbol) -> float:
-    req   = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+def get_price() -> float:
+    req   = StockLatestQuoteRequest(symbol_or_symbols=UNDERLYING)
     resp  = data_client.get_stock_latest_quote(req)
-    quote = resp[symbol]
+    quote = resp[UNDERLYING]
     price = (quote.ask_price + quote.bid_price) / 2
-    log.info(f"{symbol} mid price: {price:.2f}")
+    log.info(f"{UNDERLYING} mid price: {price:.2f}")
     return price
 
 
-def get_contracts(underlying, expiry_str):
+def get_contracts(expiry_str):
     req = GetOptionContractsRequest(
-        underlying_symbols=[underlying],
+        underlying_symbols=[UNDERLYING],
         expiration_date=expiry_str,
         limit=1000,
     )
     contracts = trade_client.get_option_contracts(req).option_contracts
-    log.info(f"Fetched {len(contracts)} contracts for {underlying} expiring {expiry_str}")
+    log.info(f"Fetched {len(contracts)} contracts expiring {expiry_str}")
     return contracts
 
 
-def build_legs(contracts, price, wing_width):
+def build_legs(contracts, price):
     puts  = sorted([c for c in contracts if c.type == ContractType.PUT],
                    key=lambda x: float(x.strike_price))
     calls = sorted([c for c in contracts if c.type == ContractType.CALL],
@@ -94,7 +90,6 @@ def build_legs(contracts, price, wing_width):
         log.warning("No puts or calls found.")
         return None
 
-    # Short strikes just OTM
     short_put_target  = price * (1 - OTM_PCT)
     short_call_target = price * (1 + OTM_PCT)
 
@@ -104,9 +99,8 @@ def build_legs(contracts, price, wing_width):
     sp_strike = float(short_put.strike_price)
     sc_strike = float(short_call.strike_price)
 
-    # Long wings further OTM
-    long_put  = min(puts,  key=lambda x: abs(float(x.strike_price) - (sp_strike - wing_width)))
-    long_call = min(calls, key=lambda x: abs(float(x.strike_price) - (sc_strike + wing_width)))
+    long_put  = min(puts,  key=lambda x: abs(float(x.strike_price) - (sp_strike - WING_WIDTH)))
+    long_call = min(calls, key=lambda x: abs(float(x.strike_price) - (sc_strike + WING_WIDTH)))
 
     log.info(
         f"Legs: Long Put {long_put.strike_price} | Short Put {short_put.strike_price} | "
@@ -121,20 +115,47 @@ def build_legs(contracts, price, wing_width):
     }
 
 
-def place_order(symbol, side):
-    o = trade_client.submit_order(MarketOrderRequest(
-        symbol        = symbol,
-        qty           = QTY,
-        side          = side,
-        time_in_force = TimeInForce.DAY,
-    ))
-    log.info(f"✅ {side.value.upper()} {symbol} | id={o.id}")
-    return o
+def get_mid_price(contract):
+    """Get mid price of an option contract."""
+    try:
+        bid = float(contract.close_price or 0.05)
+        return max(bid, 0.01)
+    except:
+        return 0.05
+
+
+def place_spread_orders(legs):
+    """
+    Place legs as individual limit orders.
+    Short legs first to establish the spread margin requirement.
+    """
+    orders = [
+        (legs["short_put"].symbol,  OrderSide.SELL, get_mid_price(legs["short_put"])),
+        (legs["long_put"].symbol,   OrderSide.BUY,  get_mid_price(legs["long_put"])),
+        (legs["short_call"].symbol, OrderSide.SELL, get_mid_price(legs["short_call"])),
+        (legs["long_call"].symbol,  OrderSide.BUY,  get_mid_price(legs["long_call"])),
+    ]
+
+    for symbol, side, price in orders:
+        limit_price = round(price * (0.95 if side == OrderSide.BUY else 1.05), 2)
+        limit_price = max(limit_price, 0.01)
+        try:
+            o = trade_client.submit_order(LimitOrderRequest(
+                symbol        = symbol,
+                qty           = QTY,
+                side          = side,
+                time_in_force = TimeInForce.DAY,
+                limit_price   = limit_price,
+            ))
+            log.info(f"✅ {side.value.upper()} {symbol} limit=${limit_price:.2f} | id={o.id}")
+        except Exception as e:
+            log.error(f"❌ Order failed {symbol}: {e}")
 
 
 def get_open_positions():
     positions = trade_client.get_all_positions()
-    return [p for p in positions if p.asset_class == AssetClass.US_OPTION]
+    return [p for p in positions if p.asset_class == AssetClass.US_OPTION
+            and UNDERLYING in p.symbol]
 
 
 def calc_pnl(positions) -> float:
@@ -150,49 +171,35 @@ def open_condor():
 
     existing = get_open_positions()
     if existing:
-        log.info(f"Already have {len(existing)} open option positions. Skipping open.")
+        log.info(f"Already have {len(existing)} open positions. Skipping.")
         return
 
-    today = datetime.date.today()
+    today  = datetime.date.today()
     expiry = today.strftime("%Y-%m-%d")
 
-    # Try SPX first, fall back to SPY
-    for underlying, wing in [("SPX", 10), ("SPY", 2)]:
-        log.info(f"Trying {underlying}...")
-        try:
-            price = get_price(underlying)
-        except Exception as e:
-            log.warning(f"Could not get {underlying} price: {e}")
-            continue
+    try:
+        price = get_price()
+    except Exception as e:
+        log.error(f"Price fetch failed: {e}")
+        return
 
-        try:
-            contracts = get_contracts(underlying, expiry)
-        except Exception as e:
-            log.warning(f"Could not get {underlying} contracts: {e}")
-            continue
+    try:
+        contracts = get_contracts(expiry)
+    except Exception as e:
+        log.error(f"Contract fetch failed: {e}")
+        return
 
-        if len(contracts) < 20:
-            log.warning(f"Not enough {underlying} contracts ({len(contracts)}). Trying next.")
-            continue
+    if len(contracts) < 20:
+        log.warning(f"Only {len(contracts)} contracts — not enough.")
+        return
 
-        legs = build_legs(contracts, price, wing)
-        if not legs:
-            log.warning(f"Could not build {underlying} legs. Trying next.")
-            continue
+    legs = build_legs(contracts, price)
+    if not legs:
+        log.warning("Could not build legs.")
+        return
 
-        # Place all 4 legs
-        try:
-            place_order(legs["short_put"].symbol,  OrderSide.SELL)
-            place_order(legs["long_put"].symbol,   OrderSide.BUY)
-            place_order(legs["short_call"].symbol, OrderSide.SELL)
-            place_order(legs["long_call"].symbol,  OrderSide.BUY)
-            log.info(f"✅ 0 DTE Iron Condor opened on {underlying} @ {price:.2f} | Expiry: {expiry}")
-            return
-        except Exception as e:
-            log.error(f"Order placement failed for {underlying}: {e}")
-            continue
-
-    log.error("Could not open condor on SPX or SPY. Both failed.")
+    place_spread_orders(legs)
+    log.info(f"✅ Iron Condor orders submitted | {UNDERLYING} @ {price:.2f} | Expiry {expiry}")
 
 
 def close_condor(force=False):
@@ -203,17 +210,15 @@ def close_condor(force=False):
         log.info("No open option positions.")
         return
 
-    pnl = calc_pnl(positions)
+    pnl    = calc_pnl(positions)
     now_et = datetime.datetime.now(ET)
-    past_close_time = now_et.hour > CLOSE_TIME[0] or (now_et.hour == CLOSE_TIME[0] and now_et.minute >= CLOSE_TIME[1])
+    past_3pm = now_et.hour >= 15
 
-    log.info(f"Current P&L: {pnl*100:.1f}% | Force: {force} | Past 3pm: {past_close_time}")
+    log.info(f"P&L: {pnl*100:.1f}% | Force: {force} | Past 3pm: {past_3pm}")
 
-    should_close = force or past_close_time or pnl >= PROFIT_TARGET
-
-    if should_close:
-        reason = "forced" if force else ("3pm cutoff" if past_close_time else f"{pnl*100:.0f}% profit target")
-        log.info(f"Closing — reason: {reason}")
+    if force or past_3pm or pnl >= PROFIT_TARGET:
+        reason = "forced" if force else ("3pm cutoff" if past_3pm else f"{pnl*100:.0f}% profit target")
+        log.info(f"Closing — {reason}")
         for pos in positions:
             try:
                 trade_client.close_position(pos.symbol)
@@ -221,7 +226,7 @@ def close_condor(force=False):
             except Exception as e:
                 log.error(f"Failed to close {pos.symbol}: {e}")
     else:
-        log.info(f"Holding — P&L {pnl*100:.1f}% hasn't hit 50% yet and before 3pm.")
+        log.info(f"Holding — {pnl*100:.1f}% not at 50% target yet.")
 
 
 if __name__ == "__main__":
