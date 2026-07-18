@@ -3,7 +3,6 @@ name: 0 DTE Condor Bot
 on:
   schedule:
     - cron: '30 14 * * 1-5'
-    - cron: '0 19 * * 1-5'
     - cron: '0 20 * * 1-5'
   workflow_dispatch:
     inputs:
@@ -20,19 +19,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install alpaca-py python-dotenv
+      - run: pip install alpaca-py
       - name: Run condor bot
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: |
-          HOUR=$(date -u +%H)
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             python iron_condor.py ${{ github.event.inputs.mode }}
-          elif [ "$HOUR" = "14" ]; then
-            python iron_condor.py open
-          elif [ "$HOUR" = "20" ]; then
+          elif [ "${{ github.event.schedule }}" = "0 20 * * 1-5" ]; then
             python iron_condor.py force-close
           else
-            python iron_condor.py close
+            python iron_condor.py open
           fi
