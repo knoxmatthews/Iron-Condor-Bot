@@ -23,7 +23,9 @@ from alpaca.trading.requests import (
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, ContractType, AssetClass
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest
+from alpaca.data.historical.option import OptionHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest, OptionLatestQuoteRequest
+from alpaca.data.enums import OptionsFeed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,8 +38,10 @@ API_KEY    = os.environ.get("ALPACA_API_KEY", "")
 API_SECRET = os.environ.get("ALPACA_SECRET_KEY", "")
 PAPER      = True
 
-UNDERLYING    = "SPY"
-QTY           = 1
+UNDERLYING     = "SPY"
+RISK_PCT       = 0.02    # risk 2% of equity per condor - reasonable for a recurring daily strategy
+MAX_CONTRACTS  = 20       # hard ceiling regardless of math - caps slippage/liquidity risk on size
+MIN_CONTRACTS  = 1
 WING_WIDTH    = 5      # $5 wide — meaningful premium, defined risk of $500 max loss
 OTM_PCT       = 0.006  # 0.6% OTM — tight enough for premium, wide enough for safety
 PROFIT_TARGET = 0.50   # close at 50% of premium collected
@@ -57,8 +61,9 @@ HOLIDAYS = {
     datetime.date(2026, 12, 25),
 }
 
-trade_client = TradingClient(API_KEY, API_SECRET, paper=PAPER)
-data_client  = StockHistoricalDataClient(API_KEY, API_SECRET)
+trade_client  = TradingClient(API_KEY, API_SECRET, paper=PAPER)
+data_client   = StockHistoricalDataClient(API_KEY, API_SECRET)
+option_client = OptionHistoricalDataClient(API_KEY, API_SECRET)
 
 
 def is_market_day(date=None):
@@ -136,16 +141,70 @@ def build_legs(contracts: list, price: float):
     }
 
 
-def place_order(symbol: str, side: OrderSide) -> bool:
+def get_option_mid_price(symbol: str) -> float:
+    """
+    Fetch the real bid/ask for an option contract and return the mid price.
+    Falls back to a conservative $0.02 estimate if the quote can't be fetched -
+    conservative meaning it UNDERESTIMATES credit, which SHRINKS position size
+    rather than inflating it. A sizing error should always fail small, not big.
+    """
+    try:
+        req   = OptionLatestQuoteRequest(symbol_or_symbols=symbol, feed=OptionsFeed.INDICATIVE)
+        quote = option_client.get_option_latest_quote(req)[symbol]
+        bid, ask = float(quote.bid_price), float(quote.ask_price)
+        if bid <= 0 and ask <= 0:
+            raise ValueError("empty quote")
+        return (bid + ask) / 2
+    except Exception as e:
+        log.warning(f"Could not get quote for {symbol}: {e} — using conservative fallback")
+        return 0.02
+
+
+def calc_contracts(legs: dict, equity: float) -> tuple:
+    """
+    Risk-based contract sizing for the condor:
+    1. Estimate net credit received per spread (short premiums - long premiums)
+    2. Max loss per contract = (wing width - net credit) x 100
+    3. Contracts = (equity x RISK_PCT) / max loss per contract, capped and floored
+    Returns (contracts, net_credit_per_share, max_loss_per_contract)
+    """
+    sp_mid = get_option_mid_price(legs["short_put"].symbol)
+    lp_mid = get_option_mid_price(legs["long_put"].symbol)
+    sc_mid = get_option_mid_price(legs["short_call"].symbol)
+    lc_mid = get_option_mid_price(legs["long_call"].symbol)
+
+    net_credit = (sp_mid + sc_mid) - (lp_mid + lc_mid)
+    net_credit = max(net_credit, 0.01)  # never let a bad quote produce negative "credit"
+
+    put_wing  = abs(float(legs["short_put"].strike_price)  - float(legs["long_put"].strike_price))
+    call_wing = abs(float(legs["long_call"].strike_price) - float(legs["short_call"].strike_price))
+    wing      = max(put_wing, call_wing)
+
+    max_loss_per_contract = (wing - net_credit) * 100
+    max_loss_per_contract = max(max_loss_per_contract, 1.0)  # avoid divide-by-zero on a weird quote
+
+    risk_dollars = equity * RISK_PCT
+    contracts    = int(risk_dollars / max_loss_per_contract)
+    contracts    = max(MIN_CONTRACTS, min(contracts, MAX_CONTRACTS))
+
+    log.info(
+        f"Sizing: net credit ${net_credit:.2f}/share | wing ${wing:.0f} | "
+        f"max loss/contract ${max_loss_per_contract:.0f} | risk budget ${risk_dollars:.0f} | "
+        f"→ {contracts} contract(s)"
+    )
+    return contracts, net_credit, max_loss_per_contract
+
+
+def place_order(symbol: str, side: OrderSide, qty: int) -> bool:
     """Place a single market order. Returns True if submitted successfully."""
     try:
         o = trade_client.submit_order(MarketOrderRequest(
             symbol        = symbol,
-            qty           = QTY,
+            qty           = qty,
             side          = side,
             time_in_force = TimeInForce.DAY,
         ))
-        log.info(f"✅ {side.value.upper()} {symbol} | id={o.id}")
+        log.info(f"✅ {side.value.upper()} {qty}x {symbol} | id={o.id}")
         return True
     except Exception as e:
         log.error(f"❌ Order failed {symbol}: {e}")
@@ -207,12 +266,17 @@ def open_condor():
         log.warning("Could not build valid legs. Skipping.")
         return
 
+    # Risk-based contract sizing - scales with account equity instead of a flat 1 contract
+    acct   = trade_client.get_account()
+    equity = float(acct.equity)
+    qty, net_credit, max_loss = calc_contracts(legs, equity)
+
     # Place all 4 legs — longs first to establish defined risk margin
     results = []
-    results.append(place_order(legs["long_put"].symbol,   OrderSide.BUY))
-    results.append(place_order(legs["long_call"].symbol,  OrderSide.BUY))
-    results.append(place_order(legs["short_put"].symbol,  OrderSide.SELL))
-    results.append(place_order(legs["short_call"].symbol, OrderSide.SELL))
+    results.append(place_order(legs["long_put"].symbol,   OrderSide.BUY,  qty))
+    results.append(place_order(legs["long_call"].symbol,  OrderSide.BUY,  qty))
+    results.append(place_order(legs["short_put"].symbol,  OrderSide.SELL, qty))
+    results.append(place_order(legs["short_call"].symbol, OrderSide.SELL, qty))
 
     if not all(results):
         log.error("Not all legs filled — attempting to close any that did open.")
@@ -225,7 +289,11 @@ def open_condor():
                 log.error(f"Emergency close failed {pos.symbol}: {e}")
         return
 
-    log.info(f"✅ Iron Condor opened | SPY @ {price:.2f} | Expiry {expiry} | Max risk ${WING_WIDTH*100}")
+    total_max_risk = max_loss * qty
+    log.info(
+        f"✅ Iron Condor opened | SPY @ {price:.2f} | Expiry {expiry} | "
+        f"{qty} contract(s) | Est. credit ${net_credit*qty*100:.0f} | Max risk ${total_max_risk:.0f}"
+    )
 
 
 def close_condor(force: bool = False):
